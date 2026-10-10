@@ -18,10 +18,12 @@ from pyspark.sql import functions as F
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data"
 
-# Thresholds. Tune these after you have looked at the first report.
-LARGE_TRANSFER_AMOUNT = 200_000   # single transfer above this amount
-FUNNEL_MIN_INCOMING = 5           # incoming payments to one account in a day
-FUNNEL_MIN_TOTAL = 500_000        # ...adding up to at least this much
+# Thresholds. Volumes differ a lot between days in this dataset, so both
+# limits are taken from the day's own distribution instead of fixed numbers.
+LARGE_TRANSFER_PERCENTILE = 0.99   # top 1% of the day's transfers by amount
+FUNNEL_PERCENTILE = 0.999          # top 0.1% of accounts by incoming payments
+FUNNEL_MIN_INCOMING = 5            # ...but never fewer than this many payments
+FUNNEL_MIN_TOTAL = 500_000         # ...adding up to at least this much
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--date", required=True, help="YYYY-MM-DD")
@@ -46,14 +48,34 @@ txns = (
     txns
     .withColumn("dest_incoming_count", F.count(F.when(moves_money, 1)).over(per_dest))
     .withColumn("dest_incoming_total", F.sum(F.when(moves_money, F.col("amount"))).over(per_dest))
+    .cache()
+)
+
+
+def percentile(df, column, p):
+    values = df.approxQuantile(column, [p], 0.0001)
+    return values[0] if values else float("inf")  # no rows: flag nothing
+
+
+# Today's limits, measured on today's data
+large_transfer_limit = percentile(
+    txns.filter(F.col("type") == "TRANSFER"), "amount", LARGE_TRANSFER_PERCENTILE
+)
+accounts = txns.filter(moves_money).select("nameDest", "dest_incoming_count").distinct()
+funnel_limit = max(
+    FUNNEL_MIN_INCOMING, percentile(accounts, "dest_incoming_count", FUNNEL_PERCENTILE)
+)
+print(
+    f"Limits for {run_date}: large transfer >= {large_transfer_limit:,.0f}, "
+    f"funnel account >= {funnel_limit:.0f} incoming payments"
 )
 
 flagged = (
     txns
-    # Rule 1: large single transfer
+    # Rule 1: unusually large transfer compared with the day's other transfers
     .withColumn(
         "rule_large_transfer",
-        (F.col("type") == "TRANSFER") & (F.col("amount") > LARGE_TRANSFER_AMOUNT),
+        (F.col("type") == "TRANSFER") & (F.col("amount") >= large_transfer_limit),
     )
     # Rule 2: the whole balance is moved out in one transaction
     .withColumn(
@@ -63,11 +85,11 @@ flagged = (
         & (F.col("newbalanceOrig") == 0)
         & (F.col("amount") == F.col("oldbalanceOrg")),
     )
-    # Rule 3: funnel account, many senders paying into the same account in a day
+    # Rule 3: funnel account, far more incoming payments than other accounts today
     .withColumn(
         "rule_funnel_account",
         moves_money
-        & (F.col("dest_incoming_count") >= FUNNEL_MIN_INCOMING)
+        & (F.col("dest_incoming_count") >= funnel_limit)
         & (F.col("dest_incoming_total") >= FUNNEL_MIN_TOTAL),
     )
     .withColumn(
@@ -75,7 +97,6 @@ flagged = (
         F.col("rule_large_transfer") | F.col("rule_account_drained") | F.col("rule_funnel_account"),
     )
 )
-flagged.cache()
 
 # One pass over the day's data for all the counts
 row = flagged.agg(
