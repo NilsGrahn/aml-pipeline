@@ -1,0 +1,7 @@
+.venv/
+data/
+airflow_home/
+__pycache__/
+
+
+{"admin": "NfdQBAXf5bPRWThH"}
